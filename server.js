@@ -9,10 +9,55 @@ const videoArchives = new Map();
 const allClients = new Set();
 
 const SOUND_COOLDOWN_MS = 20000;
+const CHAT_WINDOW_MS = 10_000;
+const MAX_MESSAGES_PER_WINDOW = 6;
+const MAX_MESSAGE_LENGTH = 280;
+const POLL_DURATION_MS = 60_000;
+
+function cleanText(value, maxLength) {
+  return String(value || '').replace(/\s+/g, ' ').trim().slice(0, maxLength);
+}
+
+function getPollResults(poll) {
+  return poll.options.map((_, index) => {
+    let votes = 0;
+    for (const vote of poll.votes.values()) if (vote === index) votes += 1;
+    return votes;
+  });
+}
+
+function sanitizePoll(poll) {
+  return {
+    creator: poll.creator,
+    question: poll.question,
+    options: poll.options,
+    results: getPollResults(poll),
+    endsAt: poll.endsAt
+  };
+}
+
+function validateChat(payload, state) {
+  const rawText = String(payload.text || '');
+  const text = cleanText(rawText, MAX_MESSAGE_LENGTH);
+  if (!text) return { error: 'Write a message before sending it.' };
+  if (rawText.length > MAX_MESSAGE_LENGTH) return { error: `Messages are limited to ${MAX_MESSAGE_LENGTH} characters.` };
+  if (/(.)\1{11,}/.test(text) || (text.match(/https?:\/\//gi) || []).length > 1) return { error: 'That message looks like spam.' };
+
+  const now = Date.now();
+  state.messageTimes = state.messageTimes.filter((time) => now - time < CHAT_WINDOW_MS);
+  if (state.messageTimes.length >= MAX_MESSAGES_PER_WINDOW) return { error: 'Slow down a little — chat is limited to 6 messages per 10 seconds.' };
+  if (state.lastText === text && now - state.lastMessageAt < 3_000) return { error: 'Please avoid sending the same message twice.' };
+
+  state.messageTimes.push(now);
+  state.lastText = text;
+  state.lastMessageAt = now;
+  return { text };
+}
 
 wss.on('connection', (ws) => {
   allClients.add(ws);
   let currentVideoId = null;
+  const clientState = { messageTimes: [], lastText: '', lastMessageAt: 0 };
 
   broadcastGlobalStats();
 
@@ -33,7 +78,8 @@ wss.on('connection', (ws) => {
             title: payload.videoTitle || 'YouTube Video',
             clients: new Set(),
             lastSoundTime: 0,
-            activePrediction: null
+            activePrediction: null,
+            activePoll: null
           });
         }
         const room = videoRooms.get(currentVideoId);
@@ -56,15 +102,27 @@ wss.on('connection', (ws) => {
           }));
         }
 
+        if (room.activePoll) {
+          ws.send(JSON.stringify({
+            type: 'POLL_SYNC',
+            poll: sanitizePoll(room.activePoll)
+          }));
+        }
+
         broadcastGlobalStats();
       }
 
       if (payload.type === 'CHAT') {
+        const validation = validateChat(payload, clientState);
+        if (validation.error) {
+          ws.send(JSON.stringify({ type: 'SYSTEM', text: `🛡️ ${validation.error}` }));
+          return;
+        }
         const messagePayload = {
           type: 'CHAT',
           scope: payload.scope || 'video',
-          user: payload.user || 'Guest',
-          text: payload.text,
+          user: cleanText(payload.user, 24) || 'Guest',
+          text: validation.text,
           videoTime: payload.videoTime || 0,
           time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
         };
@@ -201,6 +259,51 @@ wss.on('connection', (ws) => {
         room.activePrediction = null;
       }
 
+      // ROOM POLLS — a no-cost, low-friction way to react together.
+      if (payload.type === 'POLL_CREATE') {
+        if (!currentVideoId || !videoRooms.has(currentVideoId)) return;
+        const room = videoRooms.get(currentVideoId);
+        if (room.activePoll) {
+          ws.send(JSON.stringify({ type: 'SYSTEM', text: 'There is already an active poll in this room.' }));
+          return;
+        }
+
+        const question = cleanText(payload.question, 120);
+        const options = Array.isArray(payload.options)
+          ? payload.options.map((option) => cleanText(option, 42)).filter(Boolean).slice(0, 4)
+          : [];
+        if (!question || options.length < 2) {
+          ws.send(JSON.stringify({ type: 'SYSTEM', text: 'A poll needs a question and at least two choices.' }));
+          return;
+        }
+
+        const poll = {
+          creator: cleanText(payload.user, 24) || 'Guest',
+          question,
+          options,
+          votes: new Map(),
+          endsAt: Date.now() + POLL_DURATION_MS
+        };
+        room.activePoll = poll;
+        broadcastSet(room.clients, { type: 'POLL_START', poll: sanitizePoll(poll) });
+
+        setTimeout(() => {
+          if (room.activePoll !== poll) return;
+          broadcastSet(room.clients, { type: 'POLL_END', poll: sanitizePoll(poll) });
+          room.activePoll = null;
+        }, POLL_DURATION_MS);
+      }
+
+      if (payload.type === 'POLL_VOTE') {
+        if (!currentVideoId || !videoRooms.has(currentVideoId)) return;
+        const poll = videoRooms.get(currentVideoId).activePoll;
+        const option = Number.parseInt(payload.option, 10);
+        if (!poll || Date.now() >= poll.endsAt || poll.votes.has(ws) || !Number.isInteger(option) || option < 0 || option >= poll.options.length) return;
+
+        poll.votes.set(ws, option);
+        broadcastSet(videoRooms.get(currentVideoId).clients, { type: 'POLL_UPDATE', poll: sanitizePoll(poll) });
+      }
+
       // LIVE EMOTE RAID
       if (payload.type === 'START_RAID') {
         broadcastSet(allClients, {
@@ -221,6 +324,9 @@ wss.on('connection', (ws) => {
       const room = videoRooms.get(currentVideoId);
       room.clients.delete(ws);
       if (room.activePrediction) room.activePrediction.bets.delete(ws);
+      if (room.activePoll && room.activePoll.votes.delete(ws)) {
+        broadcastSet(room.clients, { type: 'POLL_UPDATE', poll: sanitizePoll(room.activePoll) });
+      }
       if (room.clients.size === 0) videoRooms.delete(currentVideoId);
     }
     broadcastGlobalStats();
